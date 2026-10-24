@@ -1,0 +1,50 @@
+# CI-Gerüst der Repo-Grundausstattung für ein Repo ohne eigene Prüfkette.
+# Der Job pruefung ist der Pflicht-Kontext des Rulesets „Grundausstattung“: ein Sammel-Job mit
+# needs auf alle Pflicht-Jobs. Er ist rot, wenn ein Pflicht-Job failure oder cancelled meldet;
+# skipped gilt als bestanden, weil Repos Jobs je Ereignis bewusst auslassen (dev.app lässt
+# build-test und e2e-web am PR aus und fährt sie nur in der Queue). Wer keine bedingten Jobs hat,
+# kann die strengere Regel aus servicewelt ci.yml:140 nehmen (nur success zählt).
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  bauen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Bauen und testen
+        # Hier die Bau- und Testbefehle des Repos eintragen (npm ci && npm test, pytest, …).
+        run: echo "Noch kein Bau- und Testbefehl hinterlegt."
+
+  pruefung:
+    needs: [bauen]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ergebnis der Pflicht-Jobs
+        env:
+          ERGEBNISSE: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          ergebnisse = json.loads(os.environ["ERGEBNISSE"])
+          for job, e in ergebnisse.items():
+              print(f"{job}: {e['result']}")
+          schlecht = [job for job, e in ergebnisse.items() if e["result"] in ("failure", "cancelled")]
+          if schlecht:
+              print("::error::Pflicht-Jobs nicht grün: " + ", ".join(schlecht))
+              sys.exit(1)
+          print("Alle Pflicht-Jobs grün oder bewusst übersprungen.")
+          PY

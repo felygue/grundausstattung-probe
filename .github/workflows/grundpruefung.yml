@@ -1,0 +1,111 @@
+# Grundprüfung der Repo-Grundausstattung (Quelle: FEGAS, grundausstattung/vorlagen/).
+#
+# Diese Datei und die Skripte unter .github/grundausstattung/ sind gestempelt (STAND) und werden
+# nicht im Repo geändert; Aktualisierung kommt per Draft-PR aus FEGAS. Repo-eigene Daten
+# (Migrationsverzeichnis, Präfixmuster, Altfälle, Deckel, Ausnahmen) stehen in
+# .github/grundausstattung/konfiguration.json und dürfen dort gepflegt werden.
+#
+# Der Job heißt grundpruefung und trägt keinen name:, weil GitHub den gemeldeten Check-Kontext
+# aus dem name: nimmt, sonst aus der Job-ID. Das Ruleset „Grundausstattung“ verlangt genau
+# diesen Kontext. merge_group ist Pflicht-Trigger: ohne ihn hängt jede Merge Queue
+# („Waiting for status to be reported“). Kein paths-Filter, sonst bleibt der Pflicht-Check bei
+# Änderungen außerhalb der Pfade für immer ausstehend.
+name: Grundprüfung
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+# Veraltete PR-Läufe abbrechen, Queue-Läufe nie (servicewelt ci.yml, 04.10.2026).
+concurrency:
+  group: grundpruefung-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  grundpruefung:
+    # Runner je Repo über die Repo-Variable GRUNDAUSSTATTUNG_RUNNER (JSON, z. B. ["self-hosted","dima"]),
+    # Rückfall ubuntu-latest. Setzen: einrichten.sh --runner '<json>' oder gh variable set.
+    runs-on: ${{ fromJSON(vars.GRUNDAUSSTATTUNG_RUNNER || '"ubuntu-latest"') }}
+    timeout-minutes: 15
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # volle Historie, damit die geänderten Migrationsdateien gegen die Basis bestimmt werden können
+          fetch-depth: 0
+
+      - name: Python mit PyYAML bereitstellen
+        # Auf Debian 13 lehnt pip ohne venv ab (PEP 668); deshalb ein venv im Runner-Temp, nur wenn PyYAML fehlt.
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "PYTHON=python3" >> "$GITHUB_ENV"
+          else
+            python3 -m venv "$RUNNER_TEMP/grundausstattung-venv"
+            "$RUNNER_TEMP/grundausstattung-venv/bin/pip" install --quiet --require-hashes -r .github/grundausstattung/anforderungen.txt
+            echo "PYTHON=$RUNNER_TEMP/grundausstattung-venv/bin/python" >> "$GITHUB_ENV"
+          fi
+
+      - name: Workflow-Härtung (permissions, pull_request_target, Pinning, Zeilentrenner, Secrets im env)
+        if: ${{ !cancelled() && env.PYTHON != '' }}
+        run: |
+          "$PYTHON" .github/grundausstattung/workflows_haertung.py .
+
+      - name: Zugangsdaten (keine versionierte .env)
+        if: ${{ !cancelled() && env.PYTHON != '' }}
+        run: |
+          "$PYTHON" .github/grundausstattung/zugangsdaten.py .
+
+      - name: Migrations-Zeitstempel eindeutig
+        if: ${{ !cancelled() && env.PYTHON != '' }}
+        run: |
+          "$PYTHON" .github/grundausstattung/migration_zeitstempel.py --wurzel .
+
+      - name: Destruktive Migrationen in den geänderten Dateien (Warnung)
+        if: ${{ !cancelled() && env.PYTHON != '' }}
+        env:
+          BASIS: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t dateien < <(git diff --name-only --diff-filter=AM "$BASIS"...HEAD -- '*.sql' 2>/dev/null || true)
+          "$PYTHON" .github/grundausstattung/migration_destruktiv.py --warnung "${dateien[@]}"
+
+      - name: Größe des PR (Richtwert unter 300 geänderte Zeilen, FEGAS Git und Liefern)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          HINZU: ${{ github.event.pull_request.additions }}
+          WEG: ${{ github.event.pull_request.deletions }}
+        run: |
+          summe=$((HINZU + WEG))
+          if [ "$summe" -gt 300 ]; then
+            echo "::warning::PR hat $summe geänderte Zeilen. Richtwert sind unter 300: ein PR, ein Thema."
+          else
+            echo "PR hat $summe geänderte Zeilen."
+          fi
+
+      - name: gitleaks laden, Prüfsumme prüfen, Arbeitsbaum scannen
+        # Version und sha256 gepinnt (servicewelt security.yml, Richter-Auflage 05.10.2026). Eine .gitleaks.toml
+        # im Repo wird automatisch benutzt; Altfälle stehen dort als [allowlist] paths, nie als Baseline mit Zeilennummern.
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          datei="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSL -o "$RUNNER_TEMP/$datei" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${datei}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$datei" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$datei" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" dir . --redact --no-banner --exit-code 1
+
+      - name: zizmor (Workflow-Sicherheitsanalyse, beratend)
+        # Beratend, bis die Repos der Gruppe ohne Befund sind; dann continue-on-error entfernen.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+        with:
+          advanced-security: false
+          annotations: true
+          persona: regular

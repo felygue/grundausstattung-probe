@@ -1,0 +1,28 @@
+{
+  "_hinweis": "Repo-eigene Daten der Grundausstattung. Diese Datei darf das Repo anpassen; die Prüfer-Skripte daneben nicht (STAND stempelt sie). Deckel sind das gemessene Ist beim Einrichten und dürfen nur sinken; pruefen.sh meldet jeden Anstieg gegen die letzte Aufzeichnung.",
+  "migrationen": {
+    "verzeichnis": null,
+    "praefix": "\\d{14}",
+    "bekannt": []
+  },
+  "deckel": {
+    "permissions_fehlt": {
+      "wert": 0,
+      "seit": "",
+      "verantwortlich": ""
+    },
+    "ungepinnt": {
+      "wert": 0,
+      "seit": "",
+      "verantwortlich": ""
+    },
+    "env_secrets": {
+      "wert": 0,
+      "seit": "",
+      "verantwortlich": ""
+    }
+  },
+  "erlaubt": {
+    "pull_request_target": {}
+  }
+}
