@@ -1,0 +1,23 @@
+# Dependabot der Repo-Grundausstattung (Vorlage aus hvtools, ohne die dortigen Modul-Labels).
+# Wöchentlich montags 06:00 Berlin, Minor und Patch gebündelt, Major einzeln zum Lesen.
+# Zusammengesetzt vom Installer aus den Bausteinen, die zum Repo passen (github-actions immer,
+# npm bei package.json, pip bei requirements.txt oder pyproject.toml, docker bei Dockerfile).
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 5
+    labels:
+      - "chore"
+      - "ci"
+    commit-message:
+      prefix: "chore(actions)"
+    groups:
+      github-actions-alle:
+        patterns:
+          - "*"
