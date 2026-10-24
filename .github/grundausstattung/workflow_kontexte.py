@@ -57,10 +57,10 @@ def laeuft_auf_default(filter_, default_branch):
     return True
 
 
-def kontexte_einer_datei(pfad):
+def kontexte_einer_datei(pfad, default_branch=None):
     try:
         doc = yaml.safe_load(pfad.read_text(encoding="utf-8"))
-    except yaml.YAMLError:
+    except (yaml.YAMLError, UnicodeDecodeError):
         return {"datei": str(pfad), "trigger": [], "jobs": [], "fehler": "YAML nicht lesbar"}
     if not isinstance(doc, dict):
         return {"datei": str(pfad), "trigger": [], "jobs": [], "fehler": "kein Mapping"}
@@ -81,7 +81,9 @@ def kontexte_einer_datei(pfad):
         else:
             kontext = str(jid)
         jobs.append({"id": str(jid), "name": name if isinstance(name, str) else None, "kontext": kontext})
-    return {"datei": str(pfad), "trigger": trigger_von(doc), "jobs": jobs, "pr_filter": pr_filter(doc)}
+    filter_ = pr_filter(doc)
+    return {"datei": str(pfad), "trigger": trigger_von(doc), "jobs": jobs, "pr_filter": filter_,
+            "laeuft_auf_default": laeuft_auf_default(filter_, default_branch)}
 
 
 def main(argv=None):
@@ -99,7 +101,7 @@ def main(argv=None):
     else:
         ordner = Path(args.wurzel) / ".github" / "workflows"
         pfade = sorted(list(ordner.glob("*.yml")) + list(ordner.glob("*.yaml"))) if ordner.is_dir() else []
-    ergebnis = [kontexte_einer_datei(p) for p in pfade]
+    ergebnis = [kontexte_einer_datei(p, args.default_branch) for p in pfade]
 
     unlesbar = [e for e in ergebnis if e.get("fehler")]
     if args.kontext:
@@ -108,7 +110,7 @@ def main(argv=None):
             print(f"KONTEXT {args.kontext}: nicht entscheidbar, unlesbare Workflow-Dateien: " + ", ".join(f"{e['datei']} ({e['fehler']})" for e in unlesbar))
             return 2
         kandidaten = [e for e in ergebnis if "pull_request" in e["trigger"] and any(j["kontext"] == args.kontext for j in e["jobs"])]
-        treffer = [e for e in kandidaten if laeuft_auf_default(e.get("pr_filter") or {"paths": False, "branches": None}, args.default_branch)]
+        treffer = [e for e in kandidaten if e.get("laeuft_auf_default")]
         if kandidaten and not treffer:
             # ein Pflicht-Kontext aus einem Workflow mit paths- oder branches-Filter bleibt bei anderen PRs für immer ausstehend
             print(f"KONTEXT {args.kontext}: vorhanden in {', '.join(e['datei'] for e in kandidaten)}, meldet aber nicht verlässlich (paths-Filter oder branches-Filter ohne den Default-Branch)")
