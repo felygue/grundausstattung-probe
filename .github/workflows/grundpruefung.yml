@@ -36,8 +36,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # volle Historie, damit die geänderten Migrationsdateien gegen die Basis bestimmt werden können
+          # volle Historie (Commit-Graph), damit die geänderten Migrationsdateien gegen die Basis bestimmt werden
+          # können; Blobs nur für den ausgecheckten Stand, nicht für jeden alten Commit (servicewelt: 427 MB gegen 6 MB)
           fetch-depth: 0
+          filter: blob:none
 
       - name: Python mit PyYAML bereitstellen
         # Auf Debian 13 lehnt pip ohne venv ab (PEP 668); deshalb ein venv im Runner-Temp, nur wenn PyYAML fehlt.
@@ -72,7 +74,11 @@ jobs:
           BASIS: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          mapfile -t dateien < <(git diff --name-only --diff-filter=AM "$BASIS"...HEAD -- '*.sql' 2>/dev/null || true)
+          if ! liste=$(git diff --name-only --diff-filter=AM "$BASIS"...HEAD -- '*.sql'); then
+            echo "::warning::Geänderte Migrationsdateien nicht bestimmbar (Basis $BASIS nicht im Klon); Prüfung übersprungen"
+            exit 0
+          fi
+          mapfile -t dateien <<<"$liste"
           "$PYTHON" .github/grundausstattung/migration_destruktiv.py --warnung "${dateien[@]}"
 
       - name: Größe des PR (Richtwert unter 300 geänderte Zeilen, FEGAS Git und Liefern)

@@ -27,22 +27,27 @@ BEKANNTE_ORTE = ("supabase/migrations", "apps/api/prisma/migrations", "prisma/mi
 
 
 def eintraege_aus_verzeichnis(verz):
+    """Unterordner und *.sql-Dateien; Einträge mit führendem Punkt (.claude-backups in facilioo-toolie) sind keine Migrationen."""
     namen = []
     for p in sorted(verz.iterdir()):
+        if p.name.startswith("."):
+            continue
         if p.is_dir() or p.suffix == ".sql":
             namen.append(p.name)
     return namen
 
 
-def pruefe(namen, praefix_re, bekannt):
-    """Liefert (fehlende_praefixe, neue_duplikate, bekannte_duplikate) als Listen."""
+def pruefe(namen, praefix_re, bekannt, ohne_praefix_bekannt=()):
+    """Liefert (fehlende_praefixe, neue_duplikate, bekannte_duplikate) als Listen.
+    Namen in ohne_praefix_bekannt sind Altfälle (hvtools 20260523T143000_…), sie zählen nicht als Fehler."""
     muster = re.compile(rf"^({praefix_re})[_-]")
     nach_praefix = {}
     ohne = []
     for name in namen:
         m = muster.match(name)
         if not m:
-            ohne.append(name)
+            if name not in set(ohne_praefix_bekannt):
+                ohne.append(name)
             continue
         nach_praefix.setdefault(m.group(1), []).append(name)
     duplikate = {p: n for p, n in nach_praefix.items() if len(n) > 1}
@@ -72,6 +77,7 @@ def main(argv=None):
     if args.bekannt:
         bekannt |= {x.strip() for x in args.bekannt.split(",") if x.strip()}
     bekannt |= set(konf.get("bekannt", []) or [])
+    ohne_praefix_bekannt = set(konf.get("ohne_praefix_bekannt", []) or [])
 
     if args.liste:
         namen = [z.strip() for z in Path(args.liste).read_text(encoding="utf-8").splitlines() if z.strip()]
@@ -95,7 +101,9 @@ def main(argv=None):
         namen = eintraege_aus_verzeichnis(verz)
         ort = str(verz)
 
-    ohne, neue, alte = pruefe(namen, praefix_re, bekannt)
+    ohne, neue, alte = pruefe(namen, praefix_re, bekannt, ohne_praefix_bekannt)
+    if ohne_praefix_bekannt:
+        print(f"::notice::{len(ohne_praefix_bekannt)} bekannte Altfälle ohne Präfix werden nicht gezählt (migrationen.ohne_praefix_bekannt)")
     for name in ohne:
         print(f"::error::{name} hat keinen Präfix nach Muster {praefix_re} (Format <praefix>_name)")
     for p, n in sorted(neue.items()):

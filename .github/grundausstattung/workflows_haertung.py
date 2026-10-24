@@ -31,9 +31,11 @@ except ImportError:  # pragma: no cover
     print("::error::PyYAML fehlt. Im Workflow legt grundpruefung.yml ein venv an; lokal: python3 -m venv .venv && .venv/bin/pip install --require-hashes -r vorlagen/.github/grundausstattung/anforderungen.txt")
     sys.exit(2)
 
-ZEILENTRENNER = {"\u0085": "U+0085", " ": "U+2028", " ": "U+2029"}
+ZEILENTRENNER = {"\u0085": "U+0085", "\u2028": "U+2028", "\u2029": "U+2029"}
 SHA_RE = re.compile(r"@[0-9a-f]{40}$")
-DECKEL_NAMEN = ("permissions_fehlt", "ungepinnt", "env_secrets")
+SECRETS_RE = re.compile(r"\$\{\{[^}]*\bsecrets\b")  # secrets.X, secrets['X'] und toJSON(secrets) im Ausdruck
+PLATZHALTER = "BEGRÜNDUNG EINTRAGEN"
+DECKEL_NAMEN = ("permissions_fehlt", "permissions_schreibend", "ungepinnt", "env_secrets")
 
 
 def lade_konfiguration(pfad):
@@ -44,9 +46,13 @@ def lade_konfiguration(pfad):
 
 
 def deckel_wert(konf, name):
+    """Deckel aus konfiguration.json; ein unlesbarer Wert gilt sichtbar als 0, der strengsten Stufe."""
+    eintrag = (konf.get("deckel") or {}).get(name)
+    roh = eintrag.get("wert", 0) if isinstance(eintrag, dict) else (eintrag or 0)
     try:
-        return int(konf.get("deckel", {}).get(name, {}).get("wert", 0))
+        return int(roh)
     except (TypeError, ValueError):
+        print(f"::warning::deckel.{name} in konfiguration.json ist kein Zahlwert ({roh!r}); es gilt 0")
         return 0
 
 
@@ -66,16 +72,24 @@ def trigger_von(doc):
 
 
 def env_mit_secrets(env):
-    """Schlüssel eines env-Blocks, deren Wert `secrets.` enthält."""
+    """Schlüssel eines env-Blocks, deren Wert im Ausdruck auf den Kontext secrets zugreift."""
     if not isinstance(env, dict):
         return []
-    return [k for k, v in env.items() if isinstance(v, str) and "secrets." in v]
+    return [k for k, v in env.items() if isinstance(v, str) and SECRETS_RE.search(v)]
+
+
+def permissions_schreibend(perm):
+    """True für `write-all` oder ein Mapping mit einem write-Wert auf Workflow-Ebene."""
+    if perm == "write-all":
+        return True
+    return isinstance(perm, dict) and any(v == "write" for v in perm.values())
 
 
 def pruefe_datei(pfad, konf):
     """Liefert den Befund einer Workflow-Datei als Wörterbuch."""
     text = pfad.read_text(encoding="utf-8")
-    befund = {"datei": str(pfad), "fehler": [], "permissions_fehlt": False, "ungepinnt": [], "env_secrets": []}
+    befund = {"datei": str(pfad), "fehler": [], "permissions_fehlt": False, "permissions_schreibend": False,
+              "ungepinnt": [], "env_secrets": [], "ausnahme_unbegruendet": []}
 
     # (4) Zeilentrenner: zeilenweise zählen, damit die Zeile im Befund steht
     for nr, zeile in enumerate(text.split("\n"), start=1):
@@ -92,20 +106,26 @@ def pruefe_datei(pfad, konf):
         befund["fehler"].append((1, "Workflow-Datei ist kein YAML-Mapping"))
         return befund
 
-    # (2) pull_request_target
-    erlaubt = konf.get("erlaubt", {}).get("pull_request_target", {})
-    if "pull_request_target" in trigger_von(doc) and pfad.name not in erlaubt:
-        befund["fehler"].append((1, "pull_request_target ohne Eintrag in erlaubt.pull_request_target der konfiguration.json; der Trigger gibt Fremdcode Zugriff auf Secrets (Nx 2025, Grafana 2025)"))
+    # (2) pull_request_target: nur mit begründeter Ausnahme; ein leerer oder Platzhalter-Grund ist keine Ausnahme
+    erlaubt = (konf.get("erlaubt") or {}).get("pull_request_target") or {}
+    if "pull_request_target" in trigger_von(doc):
+        grund = erlaubt.get(pfad.name) if isinstance(erlaubt, dict) else None
+        if grund is None:
+            befund["fehler"].append((1, "pull_request_target ohne Eintrag in erlaubt.pull_request_target der konfiguration.json; der Trigger gibt Fremdcode Zugriff auf Secrets (Nx 2025, Grafana 2025)"))
+        elif not isinstance(grund, str) or not grund.strip() or grund.startswith(PLATZHALTER):
+            befund["ausnahme_unbegruendet"].append(pfad.name)
 
     jobs = doc.get("jobs") or {}
     if not isinstance(jobs, dict):
         jobs = {}
 
-    # (1) permissions auf Workflow-Ebene oder auf jeder Job-Ebene
+    # (1) permissions auf Workflow-Ebene oder auf jeder Job-Ebene; write-all oder write auf Workflow-Ebene ist eigener Befund
     if "permissions" not in doc:
         ohne = [jid for jid, job in jobs.items() if not (isinstance(job, dict) and "permissions" in job)]
         if ohne or not jobs:
             befund["permissions_fehlt"] = True
+    elif permissions_schreibend(doc.get("permissions")):
+        befund["permissions_schreibend"] = True
 
     # (5) env mit secrets auf Workflow-Ebene
     for k in env_mit_secrets(doc.get("env")):
@@ -149,8 +169,10 @@ def main(argv=None):
         "workflows": len(dateien),
         "fehler": sum(len(b["fehler"]) for b in befunde),
         "permissions_fehlt": sum(1 for b in befunde if b["permissions_fehlt"]),
+        "permissions_schreibend": sum(1 for b in befunde if b["permissions_schreibend"]),
         "ungepinnt": sum(len(b["ungepinnt"]) for b in befunde),
         "env_secrets": sum(len(b["env_secrets"]) for b in befunde),
+        "ausnahme_unbegruendet": sum(len(b["ausnahme_unbegruendet"]) for b in befunde),
     }
     deckel = {n: deckel_wert(konf, n) for n in DECKEL_NAMEN}
     ueberschritten = [n for n in DECKEL_NAMEN if zaehler[n] > deckel[n]]
@@ -158,8 +180,9 @@ def main(argv=None):
     if args.json:
         print(json.dumps({"zaehler": zaehler, "deckel": deckel, "ueberschritten": ueberschritten,
                           "dateien": [{"datei": b["datei"], "fehler": [f"{z}: {m}" for z, m in b["fehler"]],
-                                       "permissions_fehlt": b["permissions_fehlt"], "ungepinnt": b["ungepinnt"],
-                                       "env_secrets": b["env_secrets"]} for b in befunde]}, ensure_ascii=False, indent=2))
+                                       "permissions_fehlt": b["permissions_fehlt"], "permissions_schreibend": b["permissions_schreibend"],
+                                       "ungepinnt": b["ungepinnt"], "env_secrets": b["env_secrets"],
+                                       "ausnahme_unbegruendet": b["ausnahme_unbegruendet"]} for b in befunde]}, ensure_ascii=False, indent=2))
     else:
         for b in befunde:
             rel = b["datei"]
@@ -167,6 +190,10 @@ def main(argv=None):
                 print(f"::error file={rel},line={zeile}::{meldung}")
             if b["permissions_fehlt"]:
                 print(f"::warning file={rel}::kein permissions: auf Workflow-Ebene oder an jedem Job (GITHUB_TOKEN bekommt sonst die Standardrechte)")
+            if b["permissions_schreibend"]:
+                print(f"::warning file={rel}::permissions auf Workflow-Ebene mit write oder write-all; Schreibrechte gehören an den einzelnen Job")
+            for a in b["ausnahme_unbegruendet"]:
+                print(f"::warning file={rel}::pull_request_target-Ausnahme ohne Begründung in konfiguration.json ({a}); bis ein Mensch den Grund einträgt, meldet pruefen.sh das als Abweichung")
             for u in b["ungepinnt"]:
                 print(f"::warning file={rel}::uses nicht auf Commit-SHA gepinnt: {u} (tj-actions 2025: verschobene Tags)")
             for e in b["env_secrets"]:
@@ -176,7 +203,7 @@ def main(argv=None):
             print(f"::notice::{n}: {zaehler[n]} gemessen, Deckel {deckel[n]} ({stand})")
         if not dateien:
             print(f"::notice::0 Workflows geprüft: {ordner} fehlt oder ist leer")
-        print(f"SUMMARY workflows={zaehler['workflows']} fehler={zaehler['fehler']} permissions_fehlt={zaehler['permissions_fehlt']}/{deckel['permissions_fehlt']} ungepinnt={zaehler['ungepinnt']}/{deckel['ungepinnt']} env_secrets={zaehler['env_secrets']}/{deckel['env_secrets']} ueberschritten={len(ueberschritten)}")
+        print(f"SUMMARY workflows={zaehler['workflows']} fehler={zaehler['fehler']} permissions_fehlt={zaehler['permissions_fehlt']}/{deckel['permissions_fehlt']} permissions_schreibend={zaehler['permissions_schreibend']}/{deckel['permissions_schreibend']} ungepinnt={zaehler['ungepinnt']}/{deckel['ungepinnt']} env_secrets={zaehler['env_secrets']}/{deckel['env_secrets']} ausnahme_unbegruendet={zaehler['ausnahme_unbegruendet']} ueberschritten={len(ueberschritten)}")
 
     return 1 if zaehler["fehler"] or ueberschritten else 0
 
