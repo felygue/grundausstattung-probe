@@ -3,7 +3,8 @@
 # Diese Datei und die Skripte unter .github/grundausstattung/ sind gestempelt (STAND) und werden
 # nicht im Repo geändert; Aktualisierung kommt per Draft-PR aus FEGAS. Repo-eigene Daten
 # (Migrationsverzeichnis, Präfixmuster, Altfälle, Deckel, Ausnahmen) stehen in
-# .github/grundausstattung/konfiguration.json und dürfen dort gepflegt werden.
+# .github/grundausstattung/konfiguration.json und dürfen dort gepflegt werden, aber nur in eine
+# Richtung: Deckel sinken, Ausnahmen kommen begründet dazu (Schritt Ratsche vergleicht mit dem Zielbranch).
 #
 # Der Job heißt grundpruefung und trägt keinen name:, weil GitHub den gemeldeten Check-Kontext
 # aus dem name: nimmt, sonst aus der Job-ID. Das Ruleset „Grundausstattung“ verlangt genau
@@ -68,17 +69,45 @@ jobs:
         run: |
           "$PYTHON" .github/grundausstattung/migration_zeitstempel.py --wurzel .
 
+      - name: Ratsche (Deckel und gitleaks-Ausnahmen dürfen gegenüber dem Zielbranch nur sinken)
+        if: ${{ !cancelled() && env.PYTHON != '' }}
+        env:
+          BASIS: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Der Vergleich läuft gegen den Zielbranch, nicht gegen den PR selbst: ein PR, der Deckel und Verstoß zusammen
+          # anhebt, bliebe sonst grün. Nur eine nachweislich fehlende Basisdatei ist der Erstinstallationsfall; ein
+          # Git-Fehler beim Laden ist ein Fehler dieses Laufs (GA-C2-5).
+          git cat-file -e "$BASIS^{commit}" || { echo "::error::Basis-Commit $BASIS liegt nicht im Klon (fetch-depth 0 fehlt?)"; exit 1; }
+          basis="$RUNNER_TEMP/basis"
+          mkdir -p "$basis/pruefer"
+          for pfad in .github/grundausstattung/konfiguration.json .gitleaks.toml .gitleaksignore; do
+            if git cat-file -e "$BASIS:$pfad" 2>/dev/null; then
+              git show "$BASIS:$pfad" > "$basis/$(basename "$pfad")"
+            fi
+          done
+          # Die Ratsche läuft mit dem Prüfer des Zielbranches, nicht mit dem des PR: ein PR könnte sonst Deckel und
+          # Prüfer zugleich ändern (GA-C1-10). Fehlt er dort (erster PR mit der Grundausstattung), gilt der des PR.
+          ratsche=.github/grundausstattung/ratsche.py
+          if git cat-file -e "$BASIS:$ratsche" 2>/dev/null; then
+            git show "$BASIS:$ratsche" > "$basis/pruefer/ratsche.py"
+            ratsche="$basis/pruefer/ratsche.py"
+          fi
+          "$PYTHON" -I "$ratsche" --basis "$basis" --wurzel .
+
       - name: Destruktive Migrationen in den geänderten Dateien (Warnung)
         if: ${{ !cancelled() && env.PYTHON != '' }}
         env:
           BASIS: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          if ! liste=$(git diff --name-only --diff-filter=AM "$BASIS"...HEAD -- '*.sql'); then
+          # -z: Pfade NUL-getrennt und unquotiert; mit core.quotePath käme ein Umlaut als Oktalfolge in Anführungszeichen,
+          # und der Prüfer fände die Datei nicht (GA-C1-21)
+          if ! git diff --name-only -z --diff-filter=AM "$BASIS"...HEAD -- '*.sql' > "$RUNNER_TEMP/sql-dateien"; then
             echo "::warning::Geänderte Migrationsdateien nicht bestimmbar (Basis $BASIS nicht im Klon); Prüfung übersprungen"
             exit 0
           fi
-          mapfile -t dateien <<<"$liste"
+          mapfile -d '' -t dateien < "$RUNNER_TEMP/sql-dateien"
           "$PYTHON" .github/grundausstattung/migration_destruktiv.py --warnung "${dateien[@]}"
 
       - name: Größe des PR (Richtwert unter 300 geänderte Zeilen, FEGAS Git und Liefern)

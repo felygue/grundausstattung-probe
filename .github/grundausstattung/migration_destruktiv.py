@@ -4,9 +4,9 @@
 Übernommen aus servicewelt scripts/check-migration-destruktiv.mjs (Fassung vom 25.09.2026):
 Kommentare werden vorher entfernt (#265: TRUNCATE in einer Erklärung blockierte den Deploy),
 `drop table` trifft breit (auch in Strings, etwa execute format('drop table %I')), `truncate`
-nur als Anweisung (Zeilenanfang, nach ; oder am Anfang eines Strings, ganzes Wort), also nicht
-in 'truncated' (#1767: jsonb_build_object(…,'truncated',…)), nicht in Rechtelisten und nicht in
-`revoke truncate on`. hvtools pr-checks.yml trifft `truncated` noch als Teilwort.
+als ganzes Wort außerhalb von Rechtelisten, also nicht in 'truncated' (#1767:
+jsonb_build_object(…,'truncated',…)), nicht in `grant select, truncate on` und nicht in
+`revoke truncate on`. Seit 26.10.2026 mit Zeichen-Scanner statt Regex für Kommentare und Strings.
 
 In der Grundprüfung läuft dieser Prüfer nur über die im PR geänderten Dateien und mit --warnung:
 Die Sperre selbst ist Sache des Deploy-Wegs je Repo (servicewelt deploy-stufe.yml), eine
@@ -20,16 +20,79 @@ import re
 import sys
 from pathlib import Path
 
-KOMMENTARE_RE = re.compile(r"/\*[\s\S]*?\*/|--[^\n]*")
-DESTRUKTIV_RE = re.compile(r"drop\s+table|(^|;|'|\")\s*truncate\b", re.IGNORECASE | re.MULTILINE)
+DROP_RE = re.compile(r"\bdrop\s+table\b", re.IGNORECASE)
+TRUNCATE_RE = re.compile(r"\btruncate\b", re.IGNORECASE)
+RECHTE_DAVOR_RE = re.compile(r"(\bgrant|\brevoke|,)\s*$", re.IGNORECASE)
+DOLLAR_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
 
 
 def ohne_kommentare(sql):
-    return KOMMENTARE_RE.sub("", sql)
+    """Kommentare (-- bis Zeilenende, /* … */) durch ein Leerzeichen ersetzen; Stringliterale ('…' mit '' als
+    Escape, "…", $tag$…$tag$) bleiben unverändert, ein -- oder /* darin ist kein Kommentar. Ein Zeichen-Scanner
+    statt einer Regex, weil die Regex-Fassung drei echte Fälle übersah (GA-C1-20): DROP/*c*/TABLE klebte zu
+    DROPTABLE, SELECT '--'; DROP TABLE wurde ab dem -- im String weggekürzt."""
+    out, i, n = [], 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if sql.startswith("--", i):
+            j = sql.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" ")
+            i = j
+            continue
+        if sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append(" ")
+            i = j
+            continue
+        if c in ("'", '"'):
+            # E'…' erlaubt Backslash-Escapes (E'it\'s'); sonst ist nur '' ein Escape (GA-C1-20, Runde 2)
+            escapes = c == "'" and i > 0 and sql[i - 1] in "Ee" and (i < 2 or not (sql[i - 2].isalnum() or sql[i - 2] == "_"))
+            j = i + 1
+            while j < n:
+                if escapes and sql[j] == "\\":
+                    j += 2
+                    continue
+                if sql[j] == c:
+                    if j + 1 < n and sql[j + 1] == c:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            out.append(sql[i:j + 1])
+            i = j + 1
+            continue
+        m = DOLLAR_RE.match(sql, i)
+        if m:
+            # ein Dollar-Block ist meist ausführbarer PL/pgSQL-Rumpf mit eigenen Kommentaren: innen dieselbe Bereinigung
+            tag = m.group(0)
+            j = sql.find(tag, m.end())
+            if j < 0:
+                out.append(sql[i:])
+                i = n
+            else:
+                out.append(tag + ohne_kommentare(sql[m.end():j]) + tag)
+                i = j + len(tag)
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def ist_destruktiv(sql):
-    return bool(DESTRUKTIV_RE.search(ohne_kommentare(sql)))
+    """DROP TABLE überall (auch in Strings wie execute format('drop table %I')); TRUNCATE als Anweisung: nicht
+    'truncated' (Wortgrenze), nicht in Rechtelisten (grant select, truncate on …) und nicht revoke truncate on."""
+    text = ohne_kommentare(sql)
+    if DROP_RE.search(text):
+        return True
+    for m in TRUNCATE_RE.finditer(text):
+        if RECHTE_DAVOR_RE.search(text[:m.start()]):
+            continue
+        if re.match(r"\s+on\b", text[m.end():], re.IGNORECASE):
+            continue
+        return True
+    return False
 
 
 def main(argv=None):
@@ -45,7 +108,10 @@ def main(argv=None):
     for d in args.dateien:
         p = Path(d)
         if not p.is_file():
-            continue
+            # eine übergebene, aber nicht lesbare Datei still zu überspringen, machte die Prüfung scheinbar grün (GA-C1-21)
+            print(f"::error::{d}: Datei nicht lesbar oder nicht vorhanden; Prüfung nicht möglich")
+            print(f"SUMMARY dateien={len(args.dateien)} destruktiv=-1")
+            return 2
         if ist_destruktiv(p.read_text(encoding="utf-8", errors="replace")):
             treffer.append(d)
     art = "warning" if args.warnung else "error"

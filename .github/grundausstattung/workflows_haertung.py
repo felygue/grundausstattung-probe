@@ -33,7 +33,34 @@ except ImportError:  # pragma: no cover
 
 ZEILENTRENNER = {"\u0085": "U+0085", "\u2028": "U+2028", "\u2029": "U+2029"}
 SHA_RE = re.compile(r"@[0-9a-f]{40}$")
-SECRETS_RE = re.compile(r"\$\{\{[^}]*\bsecrets\b")  # secrets.X, secrets['X'] und toJSON(secrets) im Ausdruck
+SECRETS_RE = re.compile(r"\bsecrets\b")  # secrets.X, secrets['X'] und toJSON(secrets) im Rumpf eines Ausdrucks
+
+
+def ausdruecke(text):
+    """Die Rümpfe aller ${{ … }}-Ausdrücke. Das Ende ist das erste }} außerhalb eines Stringliterals ('…', '' als
+    Escape): format('{{{0}}}', secrets.TOKEN) trägt ein }} im Literal, eine Regex bis zum ersten }} übersah das
+    Secret dahinter (GA-C1-15, Runde 2)."""
+    rumpf = []
+    i, n = 0, len(text)
+    while True:
+        a = text.find("${{", i)
+        if a < 0:
+            return rumpf
+        j = a + 3
+        start = j
+        while j < n and not text.startswith("}}", j):
+            if text[j] == "'":
+                j += 1
+                while j < n:
+                    if text[j] == "'":
+                        if j + 1 < n and text[j + 1] == "'":
+                            j += 2
+                            continue
+                        break
+                    j += 1
+            j += 1
+        rumpf.append(text[start:j])
+        i = j + 2
 PLATZHALTER = "BEGRÜNDUNG EINTRAGEN"
 DECKEL_NAMEN = ("permissions_fehlt", "permissions_schreibend", "ungepinnt", "env_secrets")
 
@@ -75,7 +102,7 @@ def env_mit_secrets(env):
     """Schlüssel eines env-Blocks, deren Wert im Ausdruck auf den Kontext secrets zugreift."""
     if not isinstance(env, dict):
         return []
-    return [k for k, v in env.items() if isinstance(v, str) and SECRETS_RE.search(v)]
+    return [k for k, v in env.items() if isinstance(v, str) and any(SECRETS_RE.search(r) for r in ausdruecke(v))]
 
 
 def permissions_schreibend(perm):
@@ -112,7 +139,7 @@ def pruefe_datei(pfad, konf):
         grund = erlaubt.get(pfad.name) if isinstance(erlaubt, dict) else None
         if grund is None:
             befund["fehler"].append((1, "pull_request_target ohne Eintrag in erlaubt.pull_request_target der konfiguration.json; der Trigger gibt Fremdcode Zugriff auf Secrets (Nx 2025, Grafana 2025)"))
-        elif not isinstance(grund, str) or not grund.strip() or grund.startswith(PLATZHALTER):
+        elif not isinstance(grund, str) or not grund.strip() or grund.strip().startswith(PLATZHALTER):
             befund["ausnahme_unbegruendet"].append(pfad.name)
 
     jobs = doc.get("jobs") or {}
